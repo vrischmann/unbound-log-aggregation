@@ -5,10 +5,24 @@ const mem = std.mem;
 
 const Scanner = @import("scanner.zig").Scanner;
 
-const Aggregates = struct {
+const GlobalAggregatesKey = struct {
+    domain_name: []const u8,
+    query_type: QueryType,
+};
+
+fn eqlGlobalAggregatesKey(a: GlobalAggregatesKey, b: GlobalAggregatesKey) bool {
+    return mem.eql(u8, a.domain_name, b.domain_name) and a.query_type == b.query_type;
+}
+
+const GlobalAggregates = struct {
     const Self = @This();
 
-    const MapType = std.AutoHashMap(Line, usize);
+    const MapType = std.HashMap(
+        GlobalAggregatesKey,
+        usize,
+        std.hash_map.getAutoHashStratFn(GlobalAggregatesKey, .DeepRecursive),
+        eqlGlobalAggregatesKey,
+    );
 
     counts: MapType,
 
@@ -22,9 +36,18 @@ const Aggregates = struct {
         };
     }
 
-    pub fn inc(self: *Self, domain_name: []const u8) !void {
-        var result = self.counts.getOrPutValue(domain_name, @as(usize, 0));
-        result.value += 1;
+    pub fn inc(self: *Self, line: Line) !bool {
+        var result = try self.counts.getOrPut(.{
+            .domain_name = line.domain_name,
+            .query_type = line.query_type,
+        });
+        if (result.found_existing) {
+            result.kv.value += 1;
+            return true;
+        } else {
+            result.kv.value = 1;
+            return false;
+        }
     }
 };
 
@@ -40,6 +63,7 @@ const Line = struct {
 };
 
 const LogLineError = error{
+    OutOfMemory,
     EmptyLine,
     NoTimestampEnd,
     InvalidTimestamp,
@@ -50,7 +74,7 @@ const LogLineError = error{
     InvalidQueryType,
 };
 
-fn parseLine(s: []const u8) LogLineError!Line {
+fn parseLine(allocator: *mem.Allocator, s: []const u8) LogLineError!Line {
     if (s.len <= 0 or s[0] != '[') return error.EmptyLine;
 
     var line = Line{
@@ -101,7 +125,7 @@ fn parseLine(s: []const u8) LogLineError!Line {
         return error.NoDomainNameEnd;
     }
 
-    line.domain_name = s2[0..domain_name_end_index.?];
+    line.domain_name = try mem.dupe(allocator, u8, s2[0..domain_name_end_index.?]);
 
     // Get query type
 
@@ -115,6 +139,10 @@ fn parseLine(s: []const u8) LogLineError!Line {
     line.query_type = std.meta.stringToEnum(QueryType, s2[0..query_type_end_index.?]) orelse return error.InvalidQueryType;
 
     return line;
+}
+
+fn aggregationKVLessThan(lhs: GlobalAggregates.MapType.KV, rhs: GlobalAggregates.MapType.KV) bool {
+    return lhs.value < rhs.value;
 }
 
 pub fn main() anyerror!void {
@@ -131,8 +159,6 @@ pub fn main() anyerror!void {
     const file = try fs.cwd().openFile(file_path, .{ .read = true });
     defer file.close();
 
-    var aggregates = Aggregates.init(allocator);
-
     // Read line by line
 
     var in_stream = file.inStream();
@@ -140,6 +166,8 @@ pub fn main() anyerror!void {
 
     var total_lines: usize = 0;
     var resolving_lines: usize = 0;
+
+    var global_aggregates = GlobalAggregates.init(allocator);
 
     while (try line_scanner.scan()) {
         const token = line_scanner.token;
@@ -150,8 +178,11 @@ pub fn main() anyerror!void {
             continue;
         }
 
-        if (parseLine(token)) |line| {
-            std.debug.warn("line: {}\n", .{line});
+        if (parseLine(allocator, token)) |line| {
+            var found_existing = try global_aggregates.inc(line);
+            if (found_existing) {
+                allocator.free(line.domain_name);
+            }
         } else |err| {
             std.debug.warn("err: {} invalid line: {}\n", .{ err, token });
         }
@@ -160,4 +191,23 @@ pub fn main() anyerror!void {
     }
 
     std.debug.warn("lines: {} resolving lines: {}\n", .{ total_lines, resolving_lines });
+
+    // Sort the aggregated values
+
+    var kvs = try allocator.alloc(GlobalAggregates.MapType.KV, global_aggregates.counts.count());
+    defer allocator.free(kvs);
+
+    var iterator = global_aggregates.counts.iterator();
+    var i: usize = 0;
+    while (iterator.next()) |kv| {
+        kvs[i] = kv.*;
+        // std.debug.warn("domain name: {:<40} query type: {} count: {}\n", .{ kv.key.domain_name, kv.key.query_type, kv.value });
+        i += 1;
+    }
+
+    std.sort.sort(GlobalAggregates.MapType.KV, kvs, aggregationKVLessThan);
+
+    for (kvs) |kv| {
+        std.debug.warn("domain name: {:<40} query type: {} count: {}\n", .{ kv.key.domain_name, kv.key.query_type, kv.value });
+    }
 }
